@@ -154,7 +154,7 @@ step(void *state)
 
 	/* invert clock */
 	setNode(state, clk0, !clk);
-	recalcNodeList(state);
+	recalcNodeList(state); // XXX not required; setNode() handles everything?
 
 	/* handle memory reads and writes */
 	if (!clk)

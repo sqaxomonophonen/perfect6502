@@ -20,6 +20,13 @@
  THE SOFTWARE.
 */
 
+#define USE_NODES_FLAGS
+#define USE_SIMPLE_GROUP_SEARCH
+#define USE_RECURSIONLESS_GROUP_ADD
+//#define USE_ALTERNATE_LISTOUT_SEARCH // << binary search... actually somewhat slower
+//#define GROUPCOUNT_DEBUG
+
+
 /************************************************************
  *
  * Libc Functions and Basic Data Types
@@ -30,6 +37,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "types.h"
+
+size_t msb;
+int ii;
+int ii2;
 
 /* the smallest types to fit the numbers */
 typedef uint16_t transnum_t;
@@ -73,6 +84,7 @@ c1c2(transnum_t tn, nodenum_t n)
 	return c;
 }
 
+
 typedef struct {
 	nodenum_t nodes;
 	nodenum_t transistors;
@@ -80,9 +92,15 @@ typedef struct {
 	nodenum_t vcc;
 
 	/* everything that describes a node */
+	#ifndef USE_NODES_FLAGS
 	bitmap_t *nodes_pullup;
 	bitmap_t *nodes_pulldown;
 	bitmap_t *nodes_value;
+	#endif
+	#ifdef USE_NODES_FLAGS
+	unsigned char* nodes_flags;
+	#endif
+
 	nodenum_t **nodes_gates;
 	c1c2_t *nodes_c1c2s;
 	count_t *nodes_gatecount;
@@ -106,11 +124,15 @@ typedef struct {
 	nodenum_t *list2;
 	list_t listout;
 
+	#ifndef USE_ALTERNATE_LISTOUT_SEARCH
 	bitmap_t *listout_bitmap;
+	#endif
 
 	nodenum_t *group;
 	count_t groupcount;
+	#ifndef USE_SIMPLE_GROUP_SEARCH
 	bitmap_t *groupbitmap;
+	#endif
 
 	enum {
 		contains_nothing,
@@ -143,7 +165,9 @@ typedef struct {
 static inline void
 bitmap_clear(bitmap_t *bitmap, count_t count)
 {
-	memset(bitmap, 0, WORDS_FOR_BITS(count)*sizeof(bitmap_t));
+	size_t sz = WORDS_FOR_BITS(count)*sizeof(bitmap_t);
+	msb += sz;
+	memset(bitmap, 0, sz);
 }
 
 static inline void
@@ -172,6 +196,7 @@ get_bitmap(bitmap_t *bitmap, int index)
  * so we don't bother initializing it properly or special-casing writes.
  */
 
+#ifndef USE_NODES_FLAGS
 static inline void
 set_nodes_pullup(state_t *state, transnum_t t, BOOL s)
 {
@@ -207,6 +232,61 @@ get_nodes_value(state_t *state, transnum_t t)
 {
 	return get_bitmap(state->nodes_value, t);
 }
+#endif
+
+#ifdef USE_NODES_FLAGS
+
+#define NODE_PULLUP   (1<<0)
+#define NODE_PULLDOWN (1<<1)
+#define NODE_HI       (1<<2)
+
+static inline void set_nodes_pullup(state_t *state, nodenum_t t, BOOL s)
+{
+	if (s) {
+		state->nodes_flags[t] |= NODE_PULLUP;
+	} else {
+		state->nodes_flags[t] &= ~NODE_PULLUP;
+	}
+}
+
+#if 0
+static inline int get_nodes_pullup(state_t *state, nodenum_t t)
+{
+	return state->nodes_flags[t] & NODE_PULLUP;
+}
+#endif
+
+static inline void set_nodes_pulldown(state_t *state, nodenum_t t, BOOL s)
+{
+	if (s) {
+		state->nodes_flags[t] |= NODE_PULLDOWN;
+	} else {
+		state->nodes_flags[t] &= ~NODE_PULLDOWN;
+	}
+}
+
+#if 0
+static inline int get_nodes_pulldown(state_t *state, nodenum_t t)
+{
+	return state->nodes_flags[t] & NODE_PULLDOWN;
+}
+#endif
+
+static inline void set_nodes_value(state_t *state, nodenum_t t, BOOL s)
+{
+	if (s) {
+		state->nodes_flags[t] |= NODE_HI;
+	} else {
+		state->nodes_flags[t] &= ~NODE_HI;
+	}
+}
+
+static inline int get_nodes_value(state_t *state, nodenum_t t)
+{
+	return !!(state->nodes_flags[t] & NODE_HI);
+}
+
+#endif
 
 /************************************************************
  *
@@ -256,16 +336,54 @@ static inline void
 listout_clear(state_t *state)
 {
 	state->listout.count = 0;
+	#ifndef USE_ALTERNATE_LISTOUT_SEARCH
 	bitmap_clear(state->listout_bitmap, state->nodes);
+	#endif
 }
 
 static inline void
-listout_add(state_t *state, nodenum_t i)
+listout_add(state_t *state, nodenum_t nn)
 {
-	if (!get_bitmap(state->listout_bitmap, i)) {
-		state->listout.list[state->listout.count++] = i;
-		set_bitmap(state->listout_bitmap, i, 1);
+	#ifdef USE_ALTERNATE_LISTOUT_SEARCH
+	/*
+	int n = state->listout.count;
+	nodenum_t* lst = state->listout.list;
+	for (int i = 0; i < n; i++) {
+		if (lst[i] == nn) return;
 	}
+	state->listout.list[state->listout.count++] = nn;
+	*/
+
+	// binary leftmost search
+	int n = state->listout.count;
+	nodenum_t* lst = state->listout.list;
+	int left = 0;
+	int right = n;
+	while (left < right) {
+		int mid = (left+right) >> 1;
+		nodenum_t value = lst[mid];
+		if (value == nn) {
+			return;
+		} else if (value < nn) {
+			left = mid + 1;
+		} else {
+			right = mid;
+		}
+	}
+	int to_move = n-left;
+	if (to_move > 0) {
+		memmove(&lst[left+1], &lst[left], to_move * sizeof(lst[0]));
+	}
+	state->listout.list[left] = nn;
+	state->listout.count++;
+	#endif
+
+	#ifndef USE_ALTERNATE_LISTOUT_SEARCH
+	if (!get_bitmap(state->listout_bitmap, nn)) {
+		state->listout.list[state->listout.count++] = nn;
+		set_bitmap(state->listout_bitmap, nn, 1);
+	}
+	#endif
 }
 
 /************************************************************
@@ -286,14 +404,18 @@ static inline void
 group_clear(state_t *state)
 {
 	state->groupcount = 0;
+	#ifndef USE_SIMPLE_GROUP_SEARCH
 	bitmap_clear(state->groupbitmap, state->nodes);
+	#endif
 }
 
 static inline void
 group_add(state_t *state, nodenum_t i)
 {
 	state->group[state->groupcount++] = i;
+	#ifndef USE_SIMPLE_GROUP_SEARCH
 	set_bitmap(state->groupbitmap, i, 1);
+	#endif
 }
 
 static inline nodenum_t
@@ -305,7 +427,17 @@ group_get(state_t *state, count_t n)
 static inline BOOL
 group_contains(state_t *state, nodenum_t el)
 {
+	#ifndef USE_SIMPLE_GROUP_SEARCH
 	return get_bitmap(state->groupbitmap, el);
+	#endif
+
+	#ifdef USE_SIMPLE_GROUP_SEARCH
+	int n = state->groupcount;
+	for (int i = 0; i < n; i++) {
+		if (state->group[i] == el) return YES;
+	}
+	return NO;
+	#endif
 }
 
 static inline count_t
@@ -320,9 +452,11 @@ group_count(state_t *state)
  *
  ************************************************************/
 
+#ifndef USE_RECURSIONLESS_GROUP_ADD
 static inline void
 addNodeToGroup(state_t *state, nodenum_t n)
 {
+	ii2++;
 	/*
 	 * We need to stop at vss and vcc, otherwise we'll revisit other groups
 	 * with the same value - just because they all derive their value from
@@ -333,16 +467,19 @@ addNodeToGroup(state_t *state, nodenum_t n)
 		return;
 	}
 	if (n == state->vcc) {
-		if (state->group_contains_value != contains_vss)
+		if (state->group_contains_value != contains_vss) {
 			state->group_contains_value = contains_vcc;
+		}
 		return;
 	}
 
-	if (group_contains(state, n))
+	if (group_contains(state, n)) {
 		return;
+	}
 
 	group_add(state, n);
 
+	#ifndef USE_NODES_FLAGS
 	if (state->group_contains_value < contains_pulldown && get_nodes_pulldown(state, n)) {
 		state->group_contains_value = contains_pulldown;
 	}
@@ -352,26 +489,138 @@ addNodeToGroup(state_t *state, nodenum_t n)
 	if (state->group_contains_value < contains_hi && get_nodes_value(state, n)) {
 		state->group_contains_value = contains_hi;
 	}
+	#endif
 
-	/* revisit all transistors that control this node */
-	count_t end = state->nodes_c1c2offset[n+1];
-	for (count_t t = state->nodes_c1c2offset[n]; t < end; t++) {
-		c1c2_t c = state->nodes_c1c2s[t];
-		/* if the transistor connects c1 and c2... */
-		if (get_transistors_on(state, c.transistor)) {
-			addNodeToGroup(state, c.other_node);
+	#ifdef USE_NODES_FLAGS
+	unsigned char flags = state->nodes_flags[n];
+	if (flags) {
+		if (state->group_contains_value < contains_pulldown && flags & NODE_PULLDOWN) {
+			state->group_contains_value = contains_pulldown;
+		}
+		if (state->group_contains_value < contains_pullup && flags & NODE_PULLUP) {
+			state->group_contains_value = contains_pullup;
+		}
+		if (state->group_contains_value < contains_hi && flags & NODE_HI) {
+			state->group_contains_value = contains_hi;
 		}
 	}
+	#endif
+
+	/* revisit all transistors that control this node */
+	count_t start = state->nodes_c1c2offset[n];
+	count_t end = state->nodes_c1c2offset[n+1];
+	for (count_t t = start; t < end; t++) {
+		c1c2_t c = state->nodes_c1c2s[t];
+
+		/* if the transistor connects c1 and c2... */
+		if (!get_transistors_on(state, c.transistor)) continue;
+
+		addNodeToGroup(state, c.other_node);
+
+	}
+
 }
+#else
+static inline void
+addNodeToGroup(state_t *state, nodenum_t root)
+{
+	#define NSTACK_MAX (4096)
+	static nodenum_t nstack[NSTACK_MAX];
+	int nstack_sz = 0;
+	nstack[nstack_sz++] = root;
+	nodenum_t prevn = -1;
+
+	while (nstack_sz > 0) {
+		nodenum_t n = nstack[--nstack_sz];
+
+		ii2++;
+		/*
+		 * We need to stop at vss and vcc, otherwise we'll revisit other groups
+		 * with the same value - just because they all derive their value from
+		 * the fact that they are connected to vcc or vss.
+		 */
+		if (n == state->vss) {
+			state->group_contains_value = contains_vss;
+			//return;
+			continue;
+		}
+		if (n == state->vcc) {
+			if (state->group_contains_value != contains_vss) {
+				state->group_contains_value = contains_vcc;
+			}
+			//return;
+			continue;
+		}
+
+		if (group_contains(state, n)) {
+			//return;
+			continue;
+		}
+
+		group_add(state, n);
+
+		#ifndef USE_NODES_FLAGS
+		if (state->group_contains_value < contains_pulldown && get_nodes_pulldown(state, n)) {
+			state->group_contains_value = contains_pulldown;
+		}
+		if (state->group_contains_value < contains_pullup && get_nodes_pullup(state, n)) {
+			state->group_contains_value = contains_pullup;
+		}
+		if (state->group_contains_value < contains_hi && get_nodes_value(state, n)) {
+			state->group_contains_value = contains_hi;
+		}
+		#endif
+
+		#ifdef USE_NODES_FLAGS
+		unsigned char flags = state->nodes_flags[n];
+		if (flags) {
+			if (state->group_contains_value < contains_pulldown && flags & NODE_PULLDOWN) {
+				state->group_contains_value = contains_pulldown;
+			}
+			if (state->group_contains_value < contains_pullup && flags & NODE_PULLUP) {
+				state->group_contains_value = contains_pullup;
+			}
+			if (state->group_contains_value < contains_hi && flags & NODE_HI) {
+				state->group_contains_value = contains_hi;
+			}
+		}
+		#endif
+
+		/* revisit all transistors that control this node */
+		count_t start = state->nodes_c1c2offset[n];
+		count_t end = state->nodes_c1c2offset[n+1];
+		for (count_t t = start; t < end; t++) {
+			c1c2_t c = state->nodes_c1c2s[t];
+			if (c.other_node == prevn) continue;
+
+			/* if the transistor connects c1 and c2... */
+			if (!get_transistors_on(state, c.transistor)) continue;
+
+			nstack[nstack_sz++] = c.other_node;
+			//if (nstack_sz > NSTACK_MAX) abort();
+		}
+
+		prevn = n;
+	}
+}
+#endif
+
+#ifdef GROUPCOUNT_DEBUG
+#define MAX_GROUPCOUNT (500)
+static int groupcounthistogram[MAX_GROUPCOUNT];
+#endif
+
 
 static inline void
 addAllNodesToGroup(state_t *state, nodenum_t node)
 {
 	group_clear(state);
-
 	state->group_contains_value = contains_nothing;
-
 	addNodeToGroup(state, node);
+	#ifdef GROUPCOUNT_DEBUG
+	if (state->groupcount >= 0 && state->groupcount < MAX_GROUPCOUNT) groupcounthistogram[state->groupcount]++;
+	#endif
+	//printf("groupcount: %d\n", state->groupcount);
 }
 
 static inline BOOL
@@ -385,19 +634,13 @@ getGroupValue(state_t *state)
 		case contains_vss:
 		case contains_pulldown:
 		case contains_nothing:
+		default:
 			return NO;
 	}
 }
 
-static inline void
-recalcNode(state_t *state, nodenum_t node)
+static inline void prop(state_t* state, nodenum_t node)
 {
-	/*
-	 * get all nodes that are connected through
-	 * transistors, starting with this one
-	 */
-	addAllNodesToGroup(state, node);
-
 	/* get the state of the group */
 	BOOL newv = getGroupValue(state);
 
@@ -407,32 +650,52 @@ recalcNode(state_t *state, nodenum_t node)
 	 * - collect all nodes behind toggled transistors
 	 *   for the next run
 	 */
-	for (count_t i = 0; i < group_count(state); i++) {
+	int n = group_count(state);
+	for (count_t i = 0; i < n; i++) {
+		ii++;
 		nodenum_t nn = group_get(state, i);
 		if (get_nodes_value(state, nn) != newv) {
 			set_nodes_value(state, nn, newv);
 			for (count_t t = 0; t < state->nodes_gatecount[nn]; t++) {
 				transnum_t tn = state->nodes_gates[nn][t];
 				set_transistors_on(state, tn, newv);
+				ii++;
 			}
 
 			if (newv) {
 				for (count_t g = 0; g < state->nodes_left_dependants[nn]; g++) {
 					listout_add(state, state->nodes_left_dependant[nn][g]);
+					ii++;
 				}
 			} else {
 				for (count_t g = 0; g < state->nodes_dependants[nn]; g++) {
 					listout_add(state, state->nodes_dependant[nn][g]);
+					ii++;
 				}
 			}
 		}
 	}
 }
 
+
+static inline void
+recalcNode(state_t *state, nodenum_t node)
+{
+	ii++;
+	/*
+	 * get all nodes that are connected through
+	 * transistors, starting with this one
+	 */
+	addAllNodesToGroup(state, node);
+	prop(state, node);
+}
+
 void
 recalcNodeList(state_t *state)
 {
-	for (int j = 0; j < 100; j++) {	/* loop limiter */
+
+	//for (int j = 0; j < 100; j++) {	/* loop limiter */
+	for (;;) {
 		/*
 		 * make the secondary list our primary list, use
 		 * the data storage of the primary list as the
@@ -452,7 +715,8 @@ recalcNodeList(state_t *state)
 		 * all transistors controlled by this path, collecting
 		 * all nodes that changed because of it for the next run
 		 */
-		for (count_t i = 0; i < listin_count(state); i++) {
+		int n = listin_count(state);
+		for (count_t i = 0; i < n; i++) {
 			nodenum_t n = listin_get(state, i);
 			recalcNode(state, n);
 		}
@@ -470,9 +734,7 @@ static inline void
 add_nodes_dependant(state_t *state, nodenum_t a, nodenum_t b)
 {
 	for (count_t g = 0; g < state->nodes_dependants[a]; g++)
-	if (state->nodes_dependant[a][g] == b)
-	return;
-
+	if (state->nodes_dependant[a][g] == b) return;
 	state->nodes_dependant[a][state->nodes_dependants[a]++] = b;
 }
 
@@ -480,24 +742,28 @@ static inline void
 add_nodes_left_dependant(state_t *state, nodenum_t a, nodenum_t b)
 {
 	for (count_t g = 0; g < state->nodes_left_dependants[a]; g++)
-	if (state->nodes_left_dependant[a][g] == b)
-	return;
-
+	if (state->nodes_left_dependant[a][g] == b) return;
 	state->nodes_left_dependant[a][state->nodes_left_dependants[a]++] = b;
 }
 
 state_t *
 setupNodesAndTransistors(netlist_transdefs *transdefs, BOOL *node_is_pullup, nodenum_t nodes, nodenum_t transistors, nodenum_t vss, nodenum_t vcc)
 {
+	//printf("node count: %d / transistor count: %d\n", nodes, transistors);
 	/* allocate state */
 	state_t *state = malloc(sizeof(state_t));
 	state->nodes = nodes;
 	state->transistors = transistors;
 	state->vss = vss;
 	state->vcc = vcc;
+	#ifndef USE_NODES_FLAGS
 	state->nodes_pullup = calloc(WORDS_FOR_BITS(state->nodes), sizeof(*state->nodes_pullup));
 	state->nodes_pulldown = calloc(WORDS_FOR_BITS(state->nodes), sizeof(*state->nodes_pulldown));
 	state->nodes_value = calloc(WORDS_FOR_BITS(state->nodes), sizeof(*state->nodes_value));
+	#endif
+	#ifdef USE_NODES_FLAGS
+	state->nodes_flags = calloc(state->nodes, sizeof(*state->nodes_flags));
+	#endif
 	state->nodes_gates = malloc(state->nodes * sizeof(*state->nodes_gates));
 	for (count_t i = 0; i < state->nodes; i++) {
 		state->nodes_gates[i] = calloc(state->nodes, sizeof(**state->nodes_gates));
@@ -520,9 +786,13 @@ setupNodesAndTransistors(netlist_transdefs *transdefs, BOOL *node_is_pullup, nod
 	state->transistors_on = calloc(WORDS_FOR_BITS(state->transistors), sizeof(*state->transistors_on));
 	state->list1 = calloc(state->nodes, sizeof(*state->list1));
 	state->list2 = calloc(state->nodes, sizeof(*state->list2));
+	#ifndef USE_ALTERNATE_LISTOUT_SEARCH
 	state->listout_bitmap = calloc(WORDS_FOR_BITS(state->nodes), sizeof(*state->listout_bitmap));
+	#endif
 	state->group = malloc(state->nodes * sizeof(*state->group));
+	#ifndef USE_SIMPLE_GROUP_SEARCH
 	state->groupbitmap = calloc(WORDS_FOR_BITS(state->nodes), sizeof(*state->groupbitmap));
+	#endif
 	state->listin.list = state->list1;
         state->listin.count = 0;
 	state->listout.list = state->list2;
@@ -594,6 +864,8 @@ setupNodesAndTransistors(netlist_transdefs *transdefs, BOOL *node_is_pullup, nod
 		state->nodes_left_dependants[i] = 0;
 		for (count_t g = 0; g < state->nodes_gatecount[i]; g++) {
 			transnum_t t = state->nodes_gates[i][g];
+
+			#if 1
 			nodenum_t c1 = state->transistors_c1[t];
 			if (c1 != vss && c1 != vcc) {
 				add_nodes_dependant(state, i, c1);
@@ -607,6 +879,22 @@ setupNodesAndTransistors(netlist_transdefs *transdefs, BOOL *node_is_pullup, nod
 			} else {
 				add_nodes_left_dependant(state, i, c2);
 			}
+			#else
+
+			// XXX not the same as above, but still works, and
+			// looks more correct?
+			nodenum_t c1 = state->transistors_c1[t];
+			nodenum_t c2 = state->transistors_c2[t];
+			if (c1 != vss && c1 != vcc) {
+				add_nodes_dependant(state, i, c1);
+				add_nodes_left_dependant(state, i, c1);
+			}
+
+			if (c2 != vss && c2 != vcc) {
+				add_nodes_dependant(state, i, c2);
+				add_nodes_left_dependant(state, i, c2);
+			}
+			#endif
 		}
 	}
 
@@ -626,43 +914,53 @@ setupNodesAndTransistors(netlist_transdefs *transdefs, BOOL *node_is_pullup, nod
 void
 destroyNodesAndTransistors(state_t *state)
 {
-    free(state->nodes_pullup);
-    free(state->nodes_pulldown);
-    free(state->nodes_value);
-    for (count_t i = 0; i < state->nodes; i++) {
-        free(state->nodes_gates[i]);
-    }
-    free(state->nodes_gates);
-    free(state->nodes_c1c2s);
-    free(state->nodes_gatecount);
-    free(state->nodes_c1c2offset);
-    free(state->nodes_dependants);
-    free(state->nodes_left_dependants);
-    for (count_t i = 0; i < state->nodes; i++) {
-        free(state->nodes_dependant[i]);
-    }
-    free(state->nodes_dependant);
-    for (count_t i = 0; i < state->nodes; i++) {
-        free(state->nodes_left_dependant[i]);
-    }
-    free(state->nodes_left_dependant);
-    free(state->transistors_gate);
-    free(state->transistors_c1);
-    free(state->transistors_c2);
-    free(state->transistors_on);
-    free(state->list1);
-    free(state->list2);
-    free(state->listout_bitmap);
-    free(state->group);
-    free(state->groupbitmap);
-    free(state);
+	#ifndef USE_NODES_FLAGS
+	free(state->nodes_pullup);
+	free(state->nodes_pulldown);
+	free(state->nodes_value);
+	#endif
+	#ifdef USE_NODES_FLAGS
+	free(state->nodes_flags);
+	#endif
+	for (count_t i = 0; i < state->nodes; i++) {
+		free(state->nodes_gates[i]);
+	}
+	free(state->nodes_gates);
+	free(state->nodes_c1c2s);
+	free(state->nodes_gatecount);
+	free(state->nodes_c1c2offset);
+	free(state->nodes_dependants);
+	free(state->nodes_left_dependants);
+	for (count_t i = 0; i < state->nodes; i++) {
+		free(state->nodes_dependant[i]);
+	}
+	free(state->nodes_dependant);
+	for (count_t i = 0; i < state->nodes; i++) {
+		free(state->nodes_left_dependant[i]);
+	}
+	free(state->nodes_left_dependant);
+	free(state->transistors_gate);
+	free(state->transistors_c1);
+	free(state->transistors_c2);
+	free(state->transistors_on);
+	free(state->list1);
+	free(state->list2);
+	#ifndef USE_ALTERNATE_LISTOUT_SEARCH
+	free(state->listout_bitmap);
+	#endif
+	free(state->group);
+	#ifndef USE_SIMPLE_GROUP_SEARCH
+	free(state->groupbitmap);
+	#endif
+	free(state);
 }
 
 void
 stabilizeChip(state_t *state)
 {
-	for (count_t i = 0; i < state->nodes; i++)
-	listout_add(state, i);
+	for (count_t i = 0; i < state->nodes; i++) {
+		listout_add(state, i);
+	}
 
 	recalcNodeList(state);
 }
@@ -676,11 +974,29 @@ stabilizeChip(state_t *state)
 void
 setNode(state_t *state, nodenum_t nn, BOOL s)
 {
+	msb = 0;
+	ii = 0;
+	ii2 = 0;
+
         set_nodes_pullup(state, nn, s);
         set_nodes_pulldown(state, nn, !s);
         listout_add(state, nn);
 
+	#ifdef GROUPCOUNT_DEBUG
+	memset(groupcounthistogram, 0, sizeof groupcounthistogram);
+	#endif
+
         recalcNodeList(state);
+
+	#ifdef GROUPCOUNT_DEBUG
+	printf("setnode nn=%d s=%d msb=%zd ii=%d ii2=%d\n", nn, s, msb, ii, ii2);
+	for (int i = MAX_GROUPCOUNT-1; i >= 0; i--) {
+		int n = groupcounthistogram[i];
+		if (n == 0) continue;
+		printf("  count:%d × %d\n", i, n);
+	}
+	printf("==================\n");
+	#endif
 }
 
 BOOL
@@ -709,6 +1025,19 @@ readNodes(state_t *state, int count, nodenum_t *nodelist)
 void
 writeNodes(state_t *state, int count, nodenum_t *nodelist, int v)
 {
+	#if 1
 	for (int i = 0; i < 8; i++, v >>= 1)
 	setNode(state, nodelist[i], v & 1);
+	#else
+
+	for (int i = 0; i < 8; i++, v >>= 1) {
+		nodenum_t nn = nodelist[i];
+		int s = v&1;
+		set_nodes_pullup(state, nn, s);
+		set_nodes_pulldown(state, nn, !s);
+		listout_add(state, nn);
+	}
+
+        recalcNodeList(state);
+	#endif
 }
